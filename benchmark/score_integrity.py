@@ -26,6 +26,7 @@ of 1; malformed/non-dict results fail the relevant checks rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,19 @@ DEFAULT_TOLERANCE = 0.002
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # Non-finite floats survive a save/load round trip (json.dump writes NaN/Infinity and
+    # json.load parses them back), but such a value is not a usable score and the round(float(...))
+    # / float() call sites that trust this helper (_round3, _top_level_weights and the nested weight
+    # lookups) would otherwise carry NaN/Infinity into the recomputed composite -- treat them as
+    # malformed, like a missing or wrong-typed field, matching row_integrity.py / tally_integrity.py
+    # (#616/#927). math.isfinite also raises OverflowError for an int too large for a float, which
+    # would crash round(float(value)) the same way.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _dict(value) -> dict:

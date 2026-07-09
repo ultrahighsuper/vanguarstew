@@ -111,6 +111,63 @@ def test_non_numeric_composite_fails_gracefully():
     assert "composite_numeric" in failed_checks(result)
 
 
+def test_non_finite_composite_fails_instead_of_raising():
+    # A composite_mean too large for a float previously raised OverflowError from
+    # round(float(value), 3); a NaN/Infinity value survives a JSON round trip too. None may
+    # crash the gate -- they must be flagged as non-numeric, like a wrong-typed field.
+    for bad in (json.loads("1" + "0" * 400), float("inf"), float("nan")):
+        art = _artifact()
+        art["composite_mean"] = bad
+        result = check_score_integrity(art)          # must not raise
+        assert result["passed"] is False
+        assert "composite_numeric" in failed_checks(result)
+
+
+def test_non_finite_component_mean_fails_instead_of_raising():
+    # Same guard on the component means (judge_mean / objective_mean), reached via the
+    # blend recompute: a non-finite value fails components_present rather than crashing.
+    for field in ("judge_mean", "objective_mean"):
+        for bad in (json.loads("1" + "0" * 400), float("inf"), float("nan")):
+            art = _artifact()
+            art["composite_parts"][field] = bad
+            result = check_score_integrity(art)      # must not raise
+            assert result["passed"] is False
+            assert "components_present" in failed_checks(result)
+
+
+def test_non_finite_numeric_fields_never_raise_for_any_field_or_shape():
+    # Every numeric field routes through _is_number before an int()/float() conversion
+    # (composite via float() in the blend recompute, scored_repos via int() in
+    # _partition_scored, the blend weights via float()). A NaN/+-Infinity value or an int
+    # too large for a float survives a JSON round trip; none may crash the gate, in the
+    # single-repo, per_repo, or generalization-partition shapes.
+    for bad in (json.loads("1" + "0" * 400), float("inf"), float("-inf"), float("nan")):
+        for path in ("composite_mean", "scored_repos"):
+            art = _artifact()
+            art[path] = bad
+            assert isinstance(check_score_integrity(art)["passed"], bool), (path, bad)
+
+        for wkey in ("judge", "objective"):
+            art = _artifact()
+            art["weights"][wkey] = bad
+            assert isinstance(check_score_integrity(art)["passed"], bool), ("weights", wkey, bad)
+
+        per_repo = {"scored_repos": 1, "composite_mean": bad,
+                    "per_repo": [{"scored_repos": bad, "composite_mean": bad,
+                                  "composite_parts": {"judge_mean": bad, "objective_mean": bad},
+                                  "weights": {"judge": bad, "objective": bad}, "rows": []}]}
+        assert isinstance(check_score_integrity(per_repo)["passed"], bool), ("per_repo", bad)
+
+        generalization = {
+            "tuned": {"scored_repos": bad, "composite_mean": bad,
+                      "composite_parts": {"judge_mean": bad, "objective_mean": bad},
+                      "weights": {"judge": bad, "objective": bad}, "rows": []},
+            "held_out": {"scored_repos": 1, "composite_mean": 0.5,
+                         "composite_parts": {"judge_mean": 0.5, "objective_mean": 0.5}, "rows": []},
+        }
+        assert isinstance(check_score_integrity(generalization)["passed"], bool), ("generalization", bad)
+
+
 def test_non_dict_artifact_fails_gracefully():
     for bad in (None, "not a dict", 42, [1, 2]):
         result = check_score_integrity(bad)
