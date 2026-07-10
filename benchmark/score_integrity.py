@@ -26,6 +26,7 @@ of 1; malformed/non-dict results fail the relevant checks rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,18 @@ DEFAULT_TOLERANCE = 0.002
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # Non-finite floats survive a save/load round trip (json.dump writes NaN/Infinity and
+    # json.load parses them back), but such a value is not a usable score and the round(float(...))
+    # / float() call sites that trust this helper would otherwise carry NaN/Infinity into the
+    # recomputed composite -- treat them as malformed, like a missing or wrong-typed field, matching
+    # row_integrity.py / tally_integrity.py (#616/#927). math.isfinite also raises OverflowError for
+    # an int too large for a float, which would crash round(float(value)) the same way.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _dict(value) -> dict:
@@ -243,7 +255,10 @@ def _partition_scored(part: dict) -> bool:
     part = _dict(part)
     scored = part.get("scored_repos")
     if _is_number(scored):
-        return int(scored) > 0
+        # ``_is_number`` rejects non-finite / oversized values, so ``scored`` is a finite number
+        # here. ``scored >= 1`` is equivalent to the previous ``int(scored) > 0`` for any finite
+        # count but performs no coercion, so this branch cannot raise on a hostile ``scored_repos``.
+        return scored >= 1
     return _is_number(part.get("composite_mean"))
 
 

@@ -17,12 +17,15 @@ from benchmark.score_integrity import (  # noqa: E402
     DEFAULT_W_OBJECTIVE,
     _check_rows_list,
     _expected_composite,
+    _partition_scored,
     _per_repo_weight_rows,
     _weights,
     check_score_integrity,
     failed_checks,
     integrity_headline,
 )
+
+_NON_FINITE = (json.loads("1" + "0" * 400), float("inf"), float("-inf"), float("nan"))
 
 
 def _artifact(composite=0.62, judge=0.7, objective=0.5, w_judge=0.6, w_objective=0.4, scored_repos=1):
@@ -109,6 +112,77 @@ def test_non_numeric_composite_fails_gracefully():
     result = check_score_integrity(art)
     assert result["passed"] is False
     assert "composite_numeric" in failed_checks(result)
+
+
+def test_non_finite_composite_fails_instead_of_raising():
+    # A composite_mean too large for a float previously raised OverflowError from
+    # round(float(value), 3); NaN/Infinity survive a JSON round trip too. None may crash the
+    # gate -- they must be flagged as non-numeric, like a wrong-typed field.
+    for bad in _NON_FINITE:
+        art = _artifact()
+        art["composite_mean"] = bad
+        result = check_score_integrity(art)          # must not raise
+        assert result["passed"] is False
+        assert "composite_numeric" in failed_checks(result)
+
+
+def test_non_finite_component_mean_fails_instead_of_raising():
+    # Same guard on the component means (judge_mean / objective_mean), reached via the blend
+    # recompute: a non-finite value fails components_present rather than crashing.
+    for field in ("judge_mean", "objective_mean"):
+        for bad in _NON_FINITE:
+            art = _artifact()
+            art["composite_parts"][field] = bad
+            result = check_score_integrity(art)      # must not raise
+            assert result["passed"] is False
+            assert "components_present" in failed_checks(result)
+
+
+def test_partition_scored_never_raises_on_non_finite_scored_repos():
+    # _partition_scored gates its scored_repos check behind _is_number, so a non-finite (or
+    # oversized) scored_repos is treated as "not a usable count" and the partition falls back to
+    # composite_mean presence -- the branch performs no int()/float() coercion and cannot raise.
+    for bad in _NON_FINITE:
+        assert _partition_scored({"scored_repos": bad, "composite_mean": 0.5}) is True
+        assert _partition_scored({"scored_repos": bad}) is False
+    # a real positive count is still "scored"; zero / negative counts are not
+    assert _partition_scored({"scored_repos": 2}) is True
+    assert _partition_scored({"scored_repos": 0}) is False
+    assert _partition_scored({"scored_repos": -1}) is False
+
+
+def test_non_finite_numeric_fields_never_raise_for_any_field_or_shape():
+    # Every numeric field routes through _is_number before any int()/float() conversion
+    # (composite via float() in the blend recompute, the blend weights via float(); scored_repos
+    # no longer coerces at all). A NaN/+-Infinity value or an int too large for a float survives a
+    # JSON round trip; none may crash the gate, in the single-repo, per_repo, or
+    # generalization-partition shapes.
+    for bad in _NON_FINITE:
+        for path in ("composite_mean", "scored_repos"):
+            art = _artifact()
+            art[path] = bad
+            assert isinstance(check_score_integrity(art)["passed"], bool), (path, bad)
+
+        for wkey in ("judge", "objective"):
+            art = _artifact()
+            art["weights"][wkey] = bad
+            assert isinstance(check_score_integrity(art)["passed"], bool), ("weights", wkey, bad)
+
+        per_repo = {"scored_repos": 1, "composite_mean": bad,
+                    "per_repo": [{"scored_repos": bad, "composite_mean": bad,
+                                  "composite_parts": {"judge_mean": bad, "objective_mean": bad},
+                                  "weights": {"judge": bad, "objective": bad}, "rows": []}]}
+        assert isinstance(check_score_integrity(per_repo)["passed"], bool), ("per_repo", bad)
+
+        generalization = {
+            "generalization_gap": 0.0,
+            "tuned": {"scored_repos": bad, "composite_mean": bad,
+                      "composite_parts": {"judge_mean": bad, "objective_mean": bad},
+                      "weights": {"judge": bad, "objective": bad}, "rows": []},
+            "held_out": {"scored_repos": 1, "composite_mean": 0.5,
+                         "composite_parts": {"judge_mean": 0.5, "objective_mean": 0.5}, "rows": []},
+        }
+        assert isinstance(check_score_integrity(generalization)["passed"], bool), ("generalization", bad)
 
 
 def test_non_dict_artifact_fails_gracefully():
