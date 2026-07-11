@@ -124,6 +124,59 @@ def test_cli_non_object_json_exits_two(tmp_path, capsys):
     assert "JSON object" in capsys.readouterr().err
 
 
+def test_cli_directory_path_exits_two_with_exact_message(tmp_path, capsys):
+    # A directory artifact path is an OSError (IsADirectoryError on POSIX, PermissionError on
+    # Windows), not a FileNotFoundError -- it must exit 2 with the EXACT actionable message, not a
+    # raw traceback and not a vague one.
+    assert cli.run([str(tmp_path)]) == 2
+    err = capsys.readouterr().err.strip()
+    assert err in {
+        f"artifact path is a directory, not a file: {tmp_path}",           # POSIX: IsADirectoryError
+        f"artifact is not readable (check file permissions): {tmp_path}",  # Windows: PermissionError
+    }
+
+
+def test_cli_permission_denied_exits_two_with_exact_message(tmp_path, capsys):
+    if os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("POSIX-only, and root bypasses file permissions")
+    path = tmp_path / "unreadable.json"
+    path.write_text(json.dumps(_run({"challenger": 1, "baseline": 0, "tie": 0})), encoding="utf-8")
+    os.chmod(path, 0)
+    try:
+        assert cli.run([str(path)]) == 2
+        assert capsys.readouterr().err.strip() == (
+            f"artifact is not readable (check file permissions): {path}"
+        )
+    finally:
+        os.chmod(path, 0o644)
+
+
+@pytest.mark.parametrize("exc_type", [BlockingIOError, InterruptedError])
+def test_cli_transient_io_error_exits_two_with_exact_message(exc_type, tmp_path, capsys, monkeypatch):
+    # BlockingIOError / InterruptedError are OSError subclasses signalling a transient, retryable
+    # condition -- they must exit 2 with a distinct, actionable message, never a raw traceback.
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(_run({"challenger": 1, "baseline": 0, "tie": 0})), encoding="utf-8")
+
+    def _raising_open(*args, **kwargs):
+        raise exc_type("transient")
+
+    monkeypatch.setattr("builtins.open", _raising_open)
+    assert cli.run([str(path)]) == 2
+    err = capsys.readouterr().err.strip()
+    assert err == f"artifact is temporarily unavailable (transient I/O error), retry: {path} (transient)"
+
+
+def test_cli_broken_symlink_exits_two(tmp_path, capsys):
+    if os.name != "posix":
+        pytest.skip("symlink creation requires privileges on Windows")
+    link = tmp_path / "dangling.json"
+    os.symlink(tmp_path / "does-not-exist.json", link)
+    # Opening a broken symlink surfaces its missing target as FileNotFoundError -> clean exit 2.
+    assert cli.run([str(link)]) == 2
+    assert capsys.readouterr().err.strip() == f"artifact not found: {link}"
+
+
 # --- generalization: sum the tuned/held_out partition tallies (mirrors win_rate) -------------
 
 def _gen(tuned_tally, held_tally):
